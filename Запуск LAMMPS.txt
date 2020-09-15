@@ -1,0 +1,153 @@
+Сначала переходим на рабочий стол: cd 'Рабочий стол'
+Затем вводим команду: вместо lmp_serial может быть lmp_mpi
+~/Загрузки/lammps-16Mar18/src/lmp_serial -in Wall_fixed2dgpu.in
+
+~/Загрузки/lammps-16Mar18/src/mpirun lmp_mpi -sf gpu -pk gpu 1 -in Wall_fixed2dgpu.in
+
+./lmp_mpi -in Wall_fixed2dgpu.in
+
+#Запуск через GPU для БОЛЬШЕГО ЧИСЛА ЧАСТИЦ 10к+
+mpirun -np 4 ~/Загрузки/lammps-16Mar18/src/lmp_mpi -in Wall_fixed2dgpu.in
+
+#Запуск через 4 ядра процессора
+mpirun -np 4 ~/Загрузки/lammps-16Mar18/src/lmp_mpi -in Wall_fixed2dcpu.in
+
+#Лучший результат ч/з GPU
+mpirun  ~/Загрузки/lammps-16Mar18/src/lmp_mpi -sf gpu -pk gpu 4 -in Wall_fixed2dgpu.in
+
+#TEST GPU
+mpirun -np 4 ~/Загрузки/lammps-16Mar18/src/lmp_mpi -sf gpu -pk gpu 1 -in Wall_fixed2dgpu.in
+
+W_Real_Test2.in - Самая полная версия моей программы на 26.11.19
+
+cd Загрузки/lammps-16Mar18/src
+
+
+Syntax from src dir: make lib-gpu args = "-m Makefile.machine -a 100 -p double -b"
+
+mpicxx -DMPI_GERYON -DUCL_NO_EXIT -DMPICH_IGNORE_CXX_SEEK -DOMPI_SKIP_MPICXX=1 -fPIC -O2 -DLAMMPS_SMALLBIG  -D_SINGLE_DOUBLE -I/usr/local/cuda-10.1/include -DUSE_CUDPP -Icudpp_mini -o nvc_get_devices ./geryon/ucl_get_devices.cpp -DUCL_CUDADR -L/usr/local/cuda-10.1/lib64 -lcuda 
+
+# В папке lib/gpu пишем команду:
+./nvc_get_devices
+
+***
+Using platform: NVIDIA Corporation NVIDIA CUDA Driver
+CUDA Driver Version:                           10.10
+
+Device 0: "GeForce GTX 1050 Ti"
+  Type of device:                                GPU
+  Compute capability:                            6.1
+  Double precision support:                      Yes
+  Total amount of global memory:                 3.94537 GB
+  Number of compute units/multiprocessors:       6
+  Number of cores:                               1152
+  Total amount of constant memory:               65536 bytes
+  Total amount of local/shared memory per block: 49152 bytes
+  Total number of registers available per block: 65536
+  Warp size:                                     32
+  Maximum number of threads per block:           1024
+  Maximum group size (# of threads per block)    1024 x 1024 x 64
+  Maximum item sizes (# threads for each dim)    2147483647 x 65535 x 65535
+  Maximum memory pitch:                          2147483647 bytes
+  Texture alignment:                             512 bytes
+  Clock rate:                                    1.62 GHz
+  Run time limit on kernels:                     Yes
+  Integrated:                                    No
+  Support host page-locked memory mapping:       Yes
+  Compute mode:                                  Default
+  Concurrent kernel execution:                   Yes
+  Device has ECC support enabled:                No
+***
+
+#Make GPU library . Исплоьзуется флаг -lx11, чтобы не было ошибки 
+in lib/gpu:
+make -f Makefile.linux.double clean 
+make -f Makefile.linux.double -lx11
+
+in /src:
+
+make no-gpu
+make mpi
+make yes-gpu
+make mpi
+
+Если mpi сбоит, то нужно очистить:
+make clean-mpi
+
+Определение безрамзмерной температуры для Ar:((1.38*10^-23)/(1.60218*0.0104*10^-19))*85
+Числовая плотность ((3.14*(0.71+5.7441)^2*16000)/(3.4050^2))/20000 при S= 20000 и N = 16000
+Числовая плотность через массовую для 2д случая: 7.76/(1/0.3405^2) = 0.8997
+
+Установка CUDA
+0) Установка зависимостей:
+а) sudo apt-get install build-essential dkms
+б) sudo apt-get install freeglut3 freeglut3-dev libxi-dev libxmu-dev
+1) В гугл: CUDA Archive
+На сайте nvidia выбираем нужную версию, желательно deb(local), скачиваем deb файл и производим установку по инструкции(также для этого стоит перенести deb файл из папки загрузки в домашнюю папку, затем ребут. Проверяем версию nvidia-smi
+2) Теперь нужно прописать пути к CUDA:
+export PATH=$PATH:/usr/local/cuda-10.1/bin
+export CUDADIR=/usr/local/cuda-10.1
+export LD_LIBRARY_PATH=$LD_LIBRARY_PATH:/usr/local/cuda-10.1/lib64
+Обязательно в пути указывать верную версию CUDA!
+Проверяем, верно ли указали пути:nvcc --version
+Если показывает информацию, то все ок.
+
+export PATH=$PATH:/usr/local/cuda-10.1/bin
+export LD_LIBRARY_PATH=$LD_LIBRARY_PATH:/usr/local/cuda-10.1/lib64 
+export LIBRARY_PATH=$LIBRARY_PATH:/usr/local/cuda-10.1/lib64
+
+make lib-gpu args="-m mpi -h /usr/local/cuda-10.1 -a sm_75 -p single -o ubuntugpu"
+
+nvcc -I/usr/local/cuda-10.1/include -DUNIX -O3 -Xptxas -v --use_fast_math -DLAMMPS_SMALLBIG -Xcompiler -fPIC -Icudpp_mini -arch=sm_75 -D_SINGLE_SINGLE --cubin -DNV_KERNEL -o atom.cubin lal_atom.cu gayberne.cubin
+
+Make.py -p gpu -gpu mode=single arch=75 -o gpu -a lib-gpu file mpi
+
+
+FROM VIDEO: cd build
+cmake -C ../cmake/presets/minimal.cmake -D PKG_GPU=on -D GPU_API=cuda -D GPU_PREC=double -D OCL_TUNE=generic -D GPU_ARCH=sm_75 -D CUDPP_OPT=yes -D CUDA_MPS_SUPPORT=yes -D PKG_USER-OMP=on ../cmake 
+
+make lib-gpu args="-m mpi -h /usr/local/cuda-10.1 -a sm_75 -p single -o ubuntugpu"
+mpirun  ~/lammps/src/lmp_mpi -sf gpu -pk gpu 24 -in Wall_fixed2dgpu.in
+mpirun -np 4 ~/lammps/src/lmp_mpi -sf gpu -pk gpu  -in Wall_fixed2dgpu.in
+mpirun  ~/lammps/src/lmp_mpi -sf gpu -pk gpu 2 -in W_Real.in
+mpirun -np 2  ~/lammps/src/lmp_mpi -sf gpu -in W_2L.in
+
+##########################################################
+Подключение библиотеки для визуализации:
+0) sudo apt-get libjpeg-dev
+1) dir: lammps/src/MAKE открываем файл Makefile.mpi
+2) В нем редактируем следующее:
+
+LMP_INC =	-DLAMMPS_GZIP -DLAMMPS_MEMALIGN=64  -DLAMMPS_JPEG -DLAMMPS_FFMPEG
+
+JPG_INC = -I/usr/include       
+JPG_PATH = -L/usr/local/lib	
+JPG_LIB = -ljpeg
+
+3) Если не работает, то в в dir : lammps/src вводим в терминале след команды:
+make clean-mpi
+make mpi
+##########################################################
+
+##########################################################
+Как прописать путь к lammps:
+1) В терминале пишем команду: nano .bashrc 
+2) В конце файла пишем путь к lmp_mpi: export PATH=~/lammps/src:$PATH 
+3) Перезапустить терминал и проверить комнадой из любой директории: lmp_mpi
+
+##########################################################
+ТЕСТ СКОРОСТИ РАСЧЕТА С N-ядрами и M - потоками через GPU!
+##########################################################
+
+1) Speed = 96.825; N = 1; M = 1; mpirun  ~/lammps/src/lmp_mpi -sf gpu -pk gpu 2 -in Evap1
+2) Speed = 95.700; N = 1; M = 2; mpirun  ~/lammps/src/lmp_mpi -sf gpu -pk gpu 2 -in Evap1
+3) Speed = 95.000; N = 2; M = 2; mpirun -np 2  ~/lammps/src/lmp_mpi -sf gpu  -in Evap1
+4) Speed = 93    ; N = 2; M = 4;
+5) Speed = 140   ; N = 4; M = 2; mpirun -np 4  ~/lammps/src/lmp_mpi -sf gpu -pk gpu 1 -in Evap1
+
+$$$$$$$$$$$$$$$$$$$$
+Для сервера amazon:
+cmake -C ../cmake/presets/minimal.cmake  -D GPU_PREC=double -D OCL_TUNE=generic -D GPU_ARCH=sm_75 -D CUDPP_OPT=yes -D CUDA_MPS_SUPPORT=yes -D PKG_USER-OMP=on ../cmake 
+$$$$$$$$$$$$$$$$$$$
+
+
