@@ -37,3 +37,4 @@ for i in range(0,8):
     virial = round(float(n_val_list1[i]) - float(n_val_list[i]),4)
     print(rho, n_val_list[i], virial, n_val_list1[i])
     rho = round(rho + 0.01,2)
+#123
