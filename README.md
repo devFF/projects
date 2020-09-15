@@ -1,4 +1,4 @@
-# projects
+# Guide
 
 1) В консоли github устанавливаем репозиторий и называем его "origin":
 git remote add origin https://github.com/devFF/projects
