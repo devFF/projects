@@ -1,0 +1,472 @@
+
+# Задача: 2 слоя жидкости и газ, в последней фазе нагреваем нижний слой. В данной версии добавляем расчет профиля давления, температуры с учетом и без гидродинамической скорости, профиль теплового потока.
+# Будем задавать плотность и длины областей, количество частиц будет подгоняться автоматически. 
+# Здесь впервые добавил расчет профиля давления, но результаты профиля не совпадают с общим давлением в системе.
+# Условие термостата сильно влияет на выделенный слой жидкости, поэтому его не учитываем при расчете давления
+# Считаю профиль давления, отдельно давление в нижнем слое жидкости, газе и верхнем слое жидкости. Давление в жидкости не согласуется с экспериментом.
+
+package gpu 1 
+
+######################### 
+# initialize simulation #
+#########################
+
+units		metal
+dimension	3
+boundary	p p f
+atom_style	atomic
+
+#####################
+# parameters - MAIN #
+#####################
+
+variable coef  		equal 0.3							# Множитель для всех длин 
+variable coefx		equal 1							# Множитель для всех длин по оси X
+variable coefy		equal 1							# Множитель для всех длин по оси Y
+variable coefz		equal 1							# Множитель для всех длин по оси Z
+
+variable XVessel	equal 200*${coef}*${coefx}				# Ширина по X, [A]
+variable YVessel	equal 200*${coef}*${coefy}				# Ширина по Y, [A]
+
+variable ZLiquid	equal 170*${coef}*${coefz}				# Пространство по Z, занимаемое нижним слоем жидкости, [A]
+variable ZGas		equal 600*${coef}*${coefz}				# Пространство по Z, занимаемое газом, [A] LV 300
+#variable DelZone	equal 70*${coef}*${coefz}				# Пространство по Z, занимаемое зоной удаления частиц, [A]
+variable ZLiquid_up	equal 170*${coef}*${coefz}				# Пространство по Z, занимаемое верхним слоем жидкости, [A]
+variable ZVessel	equal (${ZLiquid}+${ZGas}+${ZLiquid_up})		# Высота симулируемого сосуда
+variable Points		equal 100						# Количество чанков
+variable ZThickness	equal ${ZVessel}/${Points}				# Толщина одного чанка вдоль оси Z
+
+
+variable coefZL1	equal 0.1						# Доля нижнего слоя жидкости, которая будет термостатирована и использоваться как нагревающий слой
+variable coefZL2	equal 0.1						# Доля верхнего слоя жидкости, которая будет термостатирована и использоваться как нагревающий слой
+variable ZL1max		equal ${coefZL1}*${ZLiquid}				# Высота термостатированного слоя жидкости, [A] 
+
+variable ZL2min		equal ${ZL1max}						# Начало области NVE-жидкости, [A] 
+variable ZL2max		equal ${ZLiquid}					# Верхняя точка NVE-жидкости, [A]
+
+variable ZGmin		equal ${ZL2max}						# Начало области газа, [A]
+variable ZGmax		equal ${ZL2max}+${ZGas}					# Конец области газа, [A]
+
+variable ZL3min		equal ${ZGmax}						# Начало области верхнего NVE-слоя жидкости, [A]
+variable ZL3max		equal ((${ZL3min}+${ZLiquid_up})-(${coefZL2}*${ZLiquid_up})) # Конец области верхнего NVE-слоя жидкости, [A]
+
+variable ZL4min		equal ${ZL3max}						# Начало области верхнего термостатированного слоя жидкости, [A]
+variable ZL4max		equal ${ZVessel}					# Конец области верхнего термостатированного слоя жидкости, [A]
+
+variable K_B		equal 8.6173e-5						# Постоянноя Больцмана, [eV/K]
+variable Ar_mass	equal 39.95						# Масса Аргона, [а.е.м.]
+variable Ar_eps		equal 0.0103						# Параметр epsilon Ar-Ar, [eV]
+variable Ar_sigma	equal 3.4						# Параметр sigma Ar-Ar, [A]
+variable Ar_crit	equal 10.5						# Расстояние, на котором перестает действовать потенциал ЛД
+ 
+variable rhoL1 		equal 1.25537	 					# Плотность термостатированного слоя жидкости LIQUID 1, [g/cm^3] LV 1.25755
+variable rhoL2		equal 1.25537						# Плотность NVE-слоя жидкости LIQUID 2, [g/cm^3] LV 1.25755
+variable rhoG  		equal 1.25537						# Плотность газа, [g/cm^3] 
+variable rhoL3		equal 1.25537	 					# Плотность NVE-слоя жидкости LIQUID 3, [g/cm^3] LV 1.25755
+variable rhoL4		equal 1.25537						# Плотность термостатированного слоя жидкости LIQUID 4, [g/cm^3] LV 1.25755
+
+variable T_L1		equal 110						# Температура всей системы в момент приведения состояние равновесия, [K]
+variable T_L2		equal 110						# Температура нижнего термостатированного слоя жидкости LIQUID 1, [K] LV 112
+
+variable dt		equal 0.005 						# Величина временного шага, [пс] = dt*10^-12 [с]
+variable RUN 		equal 1000000 # => 5 [ns]				# Количество временных шагов
+
+##################
+# creating space #
+##################
+
+# simulated box
+region 	simbox 	block 	0 	${XVessel} 	0 	${YVessel} 	0 		${ZVessel} 	side in units box
+create_box	1 	simbox 							# Создаем ячейку и указываем кол-во типов атомов
+
+
+# Создаем подобласти: L1box -- термостатированный подслой нижнего слоя жидкости, L2box -- основная нетермостатированная NVE-подобласть нижнего слоя жидкости
+# Gbox -- область газа, L3box -- основная нетермостатированная NVE-подобласть верхнего слоя жидкости, L4box -- термостатированный подслой верхнего слоя жидкости
+
+# LIQUID 1 - THERMOSTATIC LAYER, usual 10% (lower)
+region 	L1box 	block 	0 	${XVessel} 	0 	${YVessel} 	0 		${ZL1max} 	side in units box
+
+# LIQUID 2 - NVE-liquid LAYER (lower)
+region 	L2box 	block 	0 	${XVessel} 	0 	${YVessel} 	${ZL2min} 	${ZL2max} 	side in units box
+
+# GAS
+region 	Gbox 	block 	0 	${XVessel} 	0 	${YVessel} 	${ZGmin} 	${ZGmax} 	side in units box
+
+# LIQUID 3 - NVE-liquid LAYER (upper)
+region 	L3box 	block 	0 	${XVessel} 	0 	${YVessel} 	${ZL3min} 	${ZL3max} 	side in units box
+
+# LIQUID 4 - THERMOSTATIC LAYER (upper)
+region 	L4box 	block 	0 	${XVessel} 	0 	${YVessel} 	${ZL4min} 	${ZL4max} 	side in units box
+
+# DELETION ZONE 		
+#region 	Delbox 	block 	0 	${XVessel} 	0 	${YVessel} 	${ZDelZonemin} 	${ZDelZonemax} 	side in units box
+
+
+										################################
+										# Define Interatomic Potential #
+										################################
+pair_style	lj/cut/gpu ${Ar_crit}
+pair_coeff	1 1 ${Ar_eps} ${Ar_sigma}  ${Ar_crit}
+
+#pair_modify	shift yes
+mass	1	${Ar_mass}
+
+
+# Neighbour list 
+neighbor		2 bin 
+neigh_modify		delay 10 check yes
+
+											###############
+											# p p f WALLS #  
+											###############
+# Задаем искусственые стенки с потенциалом LJ 9/3, для того, чтобы ограничить перемещение частиц по оси Z.
+
+# LOWER LJ 9/3 WALL - нижняя фиксированная стенка 
+fix 	LWALL 	all 	wall/lj93 	zlo 	0 		0.0208 3.405 8.5125	
+
+# UPPER LJ 9/3 WALL - верхняя фиксированная стенка
+fix 	UWALL 	all 	wall/lj93 	zhi 	${ZL4max}	0.0208 3.405 8.5125
+	
+
+											##########
+											# calc N # 
+											##########
+
+# Рассчитываем количесвто частиц для получения необходимой массовой плотности для каждой области
+variable MassCoef	equal 66.34 						# см. работу Wpressure или Отчет_06.03.20.pdf
+variable a_L1		equal ${ZL1max}						# Высота слоя жидкости LIQUID 1 -- нижний термостатированный
+variable a_L2		equal (${ZL2max}-${ZL1max})				# Высота слоя жидкости LIQUID 2 -- нижний NVE
+variable a_G		equal ${ZGas}						# Высота слоя газа 
+variable a_L3		equal ${ZL3max}-${ZL3min}				# Высота слоя жидкости LIQUID 3 -- верхний NVE
+variable a_L4		equal ${ZL4max}-${ZL4min}				# Высота слоя жидкости LIQUID 4 -- верхний термостатированный
+variable b		equal ${XVessel}					# Ширина области расчета по оси X
+variable c		equal ${YVessel}					# Ширина области расчета по оси Y
+
+variable N_L1		equal round(${rhoL1}*(${b}*${c}*${a_L1})/${MassCoef})	# Количество частиц в нижнем термостатированном слое жидкости -- LIQUID 1
+variable N_L2		equal round(${rhoL2}*(${b}*${c}*${a_L2})/${MassCoef})	# Количество частиц в нижнем NVE-слое жидкости -- LIQUID 2
+variable N_G		equal round(${rhoG}*(${b}*${c}*${a_G})/${MassCoef})	# Количество частиц в области газа -- GAS
+variable N_L3		equal round(${rhoL3}*(${b}*${c}*${a_L3})/${MassCoef})	# Количество частиц в верхнем NVE-слое жидкости -- LIQUID 3
+variable N_L4		equal round(${rhoL4}*(${b}*${c}*${a_L4})/${MassCoef})	# Количество частиц в верхнем термостатированном слое жидкости -- LIQUID 4
+
+variable vol_L2		equal ${a_L2}*${c}*${b}					# Объем занимаемый нижним нетермостатированным NVE-слоем жидкости
+variable vol_L3		equal ${a_L3}*${c}*${b}					# Объем занимаемый верхним нетермостатированным NVE-слоем жидкости
+
+variable vol_L12	equal ${ZLiquid}*${c}*${b}				# Объем занимаемый нижним слоем жидкости
+variable vol_G		equal ${ZGas}*${c}*${b}					# Объем занимаемый газом
+variable vol_L34	equal ${ZLiquid_up}*${c}*${b}				# Объем занимаемый верхним слоем жидкости
+
+											#################
+											# create atoms  #
+											#################
+
+create_atoms 1 random ${N_L1} 123456 L1box	# Cоздаем частицы в слое LIQUID 1
+
+create_atoms 1 random ${N_L2} 123456 L2box 	# Cоздаем частицы в слое LIQUID 2
+
+create_atoms 1 random ${N_G}  123456 Gbox	# Создаем частицы в слое GAS
+
+create_atoms 1 random ${N_L3} 123456 L3box 	# Cоздаем частицы в слое LIQUID 3
+
+create_atoms 1 random ${N_L4} 123456 L4box 	# Cоздаем частицы в слое LIQUID 4
+
+
+
+											############
+											# grouping #
+											############
+
+#group	L1	type 	1
+#group	G	type 	2
+#group	L2	type 	3
+#group	L1_G_L2 type	1 2 3
+group	RL1	region	L1box					# Группа частиц, которые содержатся в LIQUID 1
+group	RL2	region	L2box					# Группа частиц, которые содержатся в LIQUID 2
+group	RG	region	Gbox					# Группа частиц, которые содержатся в GAS
+group	RL3	region	L3box					# Группа частиц, которые содержатся в LIQUID 3
+group	RL4	region	L4box					# Группа частиц, которые содержатся в LIQUID 4
+group	RL12	union	RL1	RL2				# Объединение групп частиц, которые содержатся в LIQUID 1 и LIQUID 2 (весь нижний слой)
+group	RL34	union	RL3	RL4				# Объединение групп частиц, которые содержатся в LIQUID 3 и LIQUID 4 (весь верхний слой)
+group	AllR	union	RL1	RG	RL2	RL3	RL4	# Объединение групп частиц, которые содержатся в LIQUID 1, LIQUID 2, GAS, LIQUID 3 и LIQUID 4
+
+
+											#############
+											# DEBUGGING #
+											#############
+
+variable XVesselSigma 	equal ${XVessel}/${Ar_sigma}	# Безрамзмерное значение ширины области расчета по оси Х	
+variable YVesselSigma 	equal ${YVessel}/${Ar_sigma}	# Безрамзмерное значение ширины области расчета по оси Y
+variable ZVesselSigma 	equal ${ZVessel}/${Ar_sigma}	# Безрамзмерное значение высоты области расчета по оси Z
+variable ZLiquidSigma 	equal ${ZLiquid}/${Ar_sigma}	# Пространство по Z, занимаемое жидкостью (безразмерн.)
+variable ZGasSigma 	equal ${ZGas}/${Ar_sigma}	# Пространство по Z, занимаемое газом (безразмерн.)
+variable ZThickSigma 	equal ${ZThickness}/${Ar_sigma}	# Безрамзмерное значение толщины одного чанка вдоль оси Z
+variable Chunk_volume	equal ${ZThickness}*${b}*${c}	# Размерное значение объема одного чанка, [A^3]
+variable Chunk_vol_m3	equal ${Chunk_volume}e-30	# Размерное значение объема одного чанка, [м^3]
+
+print "											#############" screen yes
+print "											# DEBUGGING #" screen yes
+print "											#############" screen yes
+print "Количество частиц в слое жидкости LIQUID 1: N_L1 = ${N_L1}" screen yes
+print "Количество частиц в слое жидкости LIQUID 2: N_L2 = ${N_L2}" screen yes
+print "ПАРАМЕТРЫ ОБЛАСТИ РАСЧЕТА:" screen yes
+print "Ширина основной области расчета по оси X : XVessel = ${XVessel} [Ангстрем] = ${XVesselSigma}*Sigma" screen yes
+print "Ширина основной области расчета по оси Y : YVessel = ${YVessel} [Ангстрем] = ${YVesselSigma}*Sigma" screen yes
+print "Высота основной области расчета : ZVessel = ${ZVessel} [Ангстрем] = ${ZVesselSigma}*Sigma" screen yes
+print "Толщина одного чанка вдоль оси Z : ZThickness = ${ZThickness} [Ангстрем] = ${ZThickSigma}*Sigma" screen yes
+print "Объем чанка : Chunk_volume = ${Chunk_volume} [Ангстрем^3] = ${Chunk_vol_m3} [м^3]" screen yes
+print "Высота жидкости : ZLiquid = ${ZLiquid} [Ангстрем] = ${ZLiquidSigma}*Sigma" screen yes
+print "Пространство по Z, занимаеомое газом : ZGas = ${ZGas} [Ангстрем] = ${ZGasSigma}*Sigma" screen yes
+
+# Расчет плотности жидкого аргона по модифицированному уравнению Кеесома(определяющие параметры: температура жидкости, критическая плотность и критическая температура):
+variable LiqArTemp	equal 110													# Задаем температуру жидкого аргона, [K]
+variable LiqArTempc	equal 150.687													# Задаем критическую температуру аргона, [K}
+variable RhoCrit	equal 0.5355													# Критическая плотность аргона [г/см^3]
+variable Rho_Keesom 	equal ${RhoCrit}*(1+0.24144*(1-${LiqArTemp}/${LiqArTempc})+1.94154*(1-${LiqArTemp}/${LiqArTempc})^0.41469)	# Рассчитанное значение плотности, [г/см^3]
+print "Плотность жидкого Аргона при температуре Т = ${LiqArTemp} [K], полученная из мод. уравнения Кеесома: Rho = ${Rho_Keesom} [g/cm^3] " screen yes
+
+# Расчет плотности жидкого аргона по уравнению Гилгена
+variable RightValue	equal 2.7182818^(1.5004262*(1-${LiqArTemp}/${LiqArTempc})^(0.334)-0.31381290*(1-${LiqArTemp}/${LiqArTempc})^(2/3)+0.08661622*(1-${LiqArTemp}/${LiqArTempc})^(7/3)-0.041477525*(1-${LiqArTemp}/${LiqArTempc})^4) 					# Считаем правую часть уравнения Гилгена и возводим е в степень получившегося значения, чтобы избавить от логарифма в левой части уравнения.
+variable LeftValue	equal 1/${RhoCrit} 			# Заносим критическую плотность в знаменатель логарифма в левой части уравнения
+variable Rho_Gilgen	equal ${RightValue}/${LeftValue} 	# Рассчитанное значение плотности, [г/см^3]
+print "Плотность жидкого Аргона при температуре Т = ${LiqArTemp} [K], полученная из уравнения Гилгена: Rho = ${Rho_Gilgen} [g/cm^3] " screen yes
+
+print " " screen yes
+print "										########################################" screen yes
+print "										# REDUCED VALUES -> DIMENSIONAL VALUES #" screen yes
+print "										########################################" screen yes
+
+# Вводим безразмерные Reduced величины и получаем их в размерном виде для Аргона в UNITS METAL!!!
+variable AEMinGram	equal 1.6605e-24									# Из АЕМ в Граммы
+variable AngstreminCm 	equal 1e-8										# Из Ангстрем в Сантиметры
+variable ReducedRho	equal 0.625 										# Безрамерное значение плотности, [m/sigma^3]
+variable TestRho	equal (${ReducedRho}*(${Ar_mass}*${AEMinGram}))/((${Ar_sigma}^3)*${AngstreminCm}^3) 	# Размерное значение плотности, [g/cm^3]
+print "Безрамерная плотность Rho* = ${ReducedRho} в размерном виде: Rho = ${TestRho} [g/cm^3]" screen yes
+
+variable kB		equal 8.617333262e-5									# Постоянная Больцмана, [eV/K] 
+variable ReducedTemp	equal 0.73										# Безразмерная температура, [kB/epsilon]
+variable TestTemp	equal ${ReducedTemp}*${Ar_eps}/${kB}							# Размерное значение температуры, [K]
+print "Безрамерная температура T* = ${ReducedTemp} в размерном виде: T = ${TestTemp} [K]" screen yes
+
+variable EvinJoule	equal (6.24151e+18)^(-1)								# Из эВ в Дж
+variable AEMinKg	equal 1.6605e-27									# Из АЕМ в кг
+variable AngstreminM 	equal 1e-10										# Из Ангстрем в метры
+variable ReducedTau	equal 0.1										# Безразамерное значение времени, [sqrt((m*sigma^2)/epsilon)]
+variable Tau		equal ${ReducedTau}*(${Ar_mass}*${AEMinKg}*(${Ar_sigma}^2)*(${AngstreminM}^2)/(${EvinJoule}*${Ar_eps}))^(0.5)	# Размерное значение времени, [s]
+variable TauPs		equal (${Tau}*1e+12)									# Размерное значение времени, [ps]
+print "Безразмерное время Tau* = ${ReducedTau} в размерном виде: Tau = ${Tau} [c] = ${TauPs} [ps] " screen yes
+
+variable ReducedDist	equal 50										# Безармезмерное значение расстояния, [sigma]
+variable TestDist	equal ${ReducedDist}*${Ar_sigma}							# Размерное значение расстояния, [A]
+print "Безразмерное расстояние Distance* = ${ReducedDist} в размерном виде: Distance = ${TestDist} [A] " screen yes
+
+
+
+print " " screen yes
+print " " screen yes
+print "										########################################" screen yes
+print "										# DIMENSIONAL VALUES -> REDUCED VALUES #" screen yes
+print "										########################################" screen yes
+
+# Вводим размерные Dim величины в размерности UNITS METAL и получаем их в безрамерном виде
+variable DimRho		equal 1.055										# Размерное значение плотности, [g/cm^3]
+variable RhoinReduced   equal ${DimRho}*((${Ar_sigma}^3)*${AngstreminCm}^3)/(${Ar_mass}*${AEMinGram})		# Безрамерное значение плотности, [m/sigma^3]
+print "Рамерная плотность Rho = ${DimRho} [г/см^3] в безразмерном виде: Rho = ${RhoinReduced} " screen yes
+
+variable DimTemp	equal 95										# Размерная температура, [K]
+variable TempinReduced  equal ${DimTemp}*${kB}/${Ar_eps}							# Безразмерная температура 
+print "Рамерная температура T = ${DimTemp} [K] в безразмерном виде: T = ${TempinReduced} " screen yes
+
+variable DimTau 	equal 0.21															# Размерное время, [ps]
+variable TauinReduced	equal ((${EvinJoule}*${Ar_eps})/(${Ar_mass}*${AEMinKg}*(${Ar_sigma}^2)*(${AngstreminM}^2)))^(0.5)*${DimTau}*1e-12		# Безразмерное время
+print "Рамерное время Tau = ${DimTau} [ps] в безразмерном виде: Tau* = ${TauinReduced} " screen yes
+
+variable DimDist	equal 50										# Безармезмерное значение расстояния, [sigma]
+variable DistinReduced	equal ${DimDist}/${Ar_sigma}								# Размерное значение расстояния, [A]
+print "Размерное расстояние Distance = ${DimDist} в безразмерном виде: Distance* = ${DistinReduced} " screen yes
+
+
+
+
+
+
+
+											##############
+											# dump video #
+											##############
+
+dump        video all  movie  1000 W_2L_G_density.avi    type type adiam 3.4 zoom 1.2 size 1920 1080 view 90 90 # LV_adiam 2.0 LV_zoom 1.8
+dump_modify video backcolor white  boxcolor black acolor 1 red # acolor 2 blue acolor 3 green
+
+									##################################################################
+									# compute temperature, mass density profile and average pressure #
+									##################################################################
+
+# Heat Flux
+compute      	myKE all ke/atom
+compute      	myPE all pe/atom
+compute      	myStress all stress/atom NULL virial
+compute      	flux all heat/flux myKE myPE myStress
+variable     	Jx equal c_flux[1]/vol
+variable     	Jy equal c_flux[2]/vol
+variable     	Jz equal c_flux[3]/vol
+
+# Temperature profile
+compute Tprof 		AllR 	temp/profile 	0 0 1 z ${Points} out bin #40 LV 20 профиль температуры с учетом гидродинамической скорости (т.е. вычитаем скорость потока)
+#fix 	Tprofile 	all 	ave/time 	10 1000 10000 c_Tprof[2] mode vector file temp_Profile1.txt # профиль усредненных зн-й темп-ры с учетом гидродинамической скорости
+#fix 	Tprofile 	all 	ave/time 	10 10000 100000 c_Tprof[2] mode vector file temp_Profile2.txt
+
+# Average pressure and Jz 
+compute        		peratom 	all 	stress/atom NULL
+compute        		p 		all 	reduce sum c_peratom[1] c_peratom[2] c_peratom[3]
+variable       		press 		equal 	-(c_p[1]+c_p[2]+c_p[3])/(3*vol)
+fix 			AvePress 	all 	ave/time 100 100 10000 v_press v_Jz mode scalar file AvePress.txt	
+
+
+											##################
+											# compute CHUNKS #
+											##################
+
+compute 	MakeChunks 	all chunk/atom 	bin/3d x 0 ${XVessel} y 0 ${YVessel} z 0 ${ZThickness}	# Создаем чанки толщиной по оси Z равной 10 Ангстрем и шириной по осям x и y равной ширине области расчета 
+#compute		Temp_without_bias	all	temp/chunk MakeChunks	temp	Tprof
+
+#compute test all pair/local dist 
+#fix		test		all ave/chunk  	10 1000	10000 MakeChunks c_test file test.txt
+
+fix		PressProf	all ave/chunk	10 5000 50000 MakeChunks density/mass temp bias Tprof file DensityProfile.txt #100 10 1000
+fix		temp_bias	all ave/chunk	10 5000 50000 MakeChunks density/mass temp bias Tprof file temp_bias.txt # Профиль температуры с учетом скорости смещения(гидродинамическиой скорости)
+fix		temp_KE		all ave/chunk	10 5000 50000 MakeChunks density/mass temp file temp_KE.txt #100 10 1000 Профиль температуры БЕЗ учета скорости смещения(гидродинамическиой скорости)
+
+# Определяем температуру через temp/chunk и пытаемся получить профиль через ave/time или ave/chunk
+#compute 	temp_KE_c	all temp/chunk 	MakeChunks temp # simple KE
+#compute		temp_bias_c	all temp/chunk 	MakeChunks internal # KE - ave velocity
+
+#fix 		Tprofile 	all ave/time 	10000 1 10000 c_temp_KE_c c_temp_bias_c file temp_Profile1.txt mode vector # профиль усредненных зн-й темп-ры с учетом гидродинамической скорости
+
+# press profile
+compute 	myT		all temp # определяем температуру
+compute     	my_stress 	all stress/atom 	myT  # определяем тензор напряжения
+compute		my_press	all reduce sum c_my_stress[1] c_my_stress[2] c_my_stress[3] # Sxx Syy Szz, sum - суммируем диагональные компоненты тензора напряжений для каждого атома 
+variable	sys_press	equal	-(c_my_press[1]+c_my_press[2]+c_my_press[3])/(3*vol) # Давление считаем как среднее диагональных компонент и делим на объем
+
+# out press profile
+variable	pp		atom -(c_my_stress[1]+c_my_stress[2]+c_my_stress[3])/(3*v_Chunk_volume) # Получаем значение напряжения для каждого атома в чанке
+fix		press_prof	all ave/chunk 	10 5000 50000 MakeChunks v_pp temp bias Tprof file pp.dat ave one	# Усредняем значение напряжения на каждый атом в чанке, чтобы получить давление в чанке, необходимо давление на один атом умножить на количество атомов в чанке, это делается в питоне!
+
+# pressure profile in different region: lower liguid layer, gas and upper liquid layer:
+# lower liquid layer:
+compute     	my_stress_L2 	RL2 stress/atom 	myT 
+compute		my_press_L2	RL2 reduce sum c_my_stress_L2[1] c_my_stress_L2[2] c_my_stress_L2[3]
+variable	sys_press_L2	equal	-(c_my_press_L2[1]+c_my_press_L2[2]+c_my_press_L2[3])/(3*${vol_L2})
+
+# gas layer:
+compute     	my_stress_G 	RG stress/atom 	myT 
+compute		my_press_G	RG reduce sum c_my_stress_G[1] c_my_stress_G[2] c_my_stress_G[3]
+variable	sys_press_G	equal	-(c_my_press_G[1]+c_my_press_G[2]+c_my_press_G[3])/(3*${vol_G})
+
+# lower liquid layer:
+compute     	my_stress_L3 	RL3	 stress/atom 	myT 
+compute		my_press_L3	RL3	 reduce sum c_my_stress_L3[1] c_my_stress_L3[2] c_my_stress_L3[3]
+variable	sys_press_L3	equal	-(c_my_press_L3[1]+c_my_press_L3[2]+c_my_press_L3[3])/(3*${vol_L3})
+
+fix		test_sys_pr	all ave/time	10 5000 50000 v_sys_press v_sys_press_L2 v_sys_press_G v_sys_press_L3 file sys_press.dat
+#fix		force		all ave/chunk	10 1000 10000 MakeChunks fx fy fz file force.dat  # Выводим компоненты силы в каждом чанке: для газа большинство значений положительны, значит учет вирила при расчете давления приводит к тому, что значение давения становится меньше, относительно выражения p= NkT/V. Т.к. вычитаем значение вириала из NkT/V: p = NkT/V - W.
+
+
+
+
+thermo	1000
+thermo_style	custom	step	temp	press	v_sys_press	v_sys_press_L2		v_sys_press_G		v_sys_press_L3	
+
+
+
+	
+
+
+
+											#################
+											# equilibration #
+											#################
+
+
+fix	Force1	all	setforce 	0.0 0.0 0.0
+unfix	Force1
+
+# Применение функции NVE/LIMIT - позволяет избежать перекрытия частиц в начальный момент времени, аналог функции minimize
+timestep	0.001
+fix 		NVELIM 	AllR 	nve/limit	 0.002
+run_style	verlet
+run 		3000
+unfix		NVELIM
+print         	"NVE/LIMIT DONE"	
+
+# Стабилизируем систему
+variable	dt1		equal	0.002 # 0.001
+variable	Tdamp1		equal	100*${dt1}
+timestep	${dt1}	
+
+fix		NVE_all all	nve
+fix		Lang	all	langevin	${T_L1}		${T_L1}		5		3333
+
+run_style	verlet
+run 		200000
+
+unfix Lang
+											###############
+											# Evaporation #
+											###############
+
+# Увеличиваем температуру нижнего термостатированного подслоя жидкости
+variable	dt4		equal	0.02
+variable	Tdamp4		equal	100*${dt4}
+timestep	${dt4}
+
+fix		LangL1	RL1	langevin	${T_L2}		${T_L2}		5		3333
+fix		LangL4  RL4	langevin	${T_L1}		${T_L1}		5		3333
+
+thermo		1000
+thermo_style	custom	step	temp	press	v_sys_press	v_sys_press_L2		v_sys_press_G		v_sys_press_L3	 
+#thermo_style	custom	step	temp	press	 density	vol	atoms	ke	pe	 etotal
+run_style	verlet
+run		2400000	# => 12 [ns]
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
